@@ -63,7 +63,7 @@ def resolve_known_folder_guid_path(path_text: str) -> str:
     Some Start Menu shortcuts store their target as a GUID-based path such as
     ``{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\msinfo32.exe``,
     where the leading ``{...}`` is a Known Folder ID (e.g. the Windows directory).
-    ``Start-Process`` cannot launch these paths directly, so this function calls
+    The shell cannot launch these paths directly, so this function calls
     ``SHGetKnownFolderPath`` to resolve the GUID to its actual location.
 
     Args:

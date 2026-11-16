@@ -2,7 +2,6 @@ from windows_mcp.desktop.utils import (
     as_bool,
     resolve_known_folder_guid_path,
 )
-from windows_mcp.powershell.utils import ps_quote
 from windows_mcp.powershell import PowerShellExecutor
 from windows_mcp.vdm.core import (
     get_all_desktops,
@@ -25,6 +24,9 @@ from markdownify import markdownify
 from fuzzywuzzy import process
 from time import sleep, time, perf_counter
 from psutil import Process
+from win32com.shell import shell, shellcon
+import win32com.client
+import pywintypes
 import math
 import win32process
 import win32gui
@@ -33,7 +35,6 @@ import requests
 import logging
 import random
 import ctypes
-import csv
 import re
 import os
 import io
@@ -384,55 +385,29 @@ class Desktop:
         return uia.GetCursorPos()
 
     def get_apps_from_start_menu(self) -> dict[str, str]:
-        """Get installed apps. Tries Get-StartApps first, falls back to shortcut scanning."""
-        command = "Get-StartApps | ConvertTo-Csv -NoTypeInformation"
-        apps_info, status = PowerShellExecutor.execute_command(command)
-
-        apps: dict[str, str] = {}
-        if status == 0 and apps_info and apps_info.strip():
-            try:
-                reader = csv.DictReader(io.StringIO(apps_info.strip()))
-                apps = {
-                    row.get("Name", "").lower(): row.get("AppID", "")
-                    for row in reader
-                    if row.get("Name") and row.get("AppID")
-                }
-            except Exception as e:
-                logger.warning(f"Error parsing Get-StartApps output: {e}")
-
+        """Get installed apps from the AppsFolder, falling back to shortcut scanning."""
+        apps = self._get_apps_folder_display_names()
         if not apps:
             # Fallback: scan Start Menu shortcut folders (works on all Windows versions)
-            logger.info("Get-StartApps unavailable, falling back to Start Menu folder scan")
+            logger.info("AppsFolder unavailable, falling back to Start Menu folder scan")
             apps = self._get_apps_from_shortcuts()
-
-        # AppsFolder supplies the display name rendered for the current Windows locale.
-        for name, appid in self._get_apps_folder_display_names().items():
-            apps.setdefault(name, appid)
         return apps
 
     def _get_apps_folder_display_names(self) -> dict[str, str]:
         """Return localized Start Menu display names mapped to AppUserModelIDs."""
-        command = (
-            "(New-Object -ComObject Shell.Application)."
-            "NameSpace('shell:::{4234d49b-0245-4df3-b780-3893943456e1}').Items() "
-            "| Select-Object Name,@{n='AppID';e={$_.Path}} | ConvertTo-Csv -NoTypeInformation"
-        )
-        apps_info, status = PowerShellExecutor.execute_command(command)
-
-        if status == 0 and apps_info and apps_info.strip():
-            try:
-                reader = csv.DictReader(io.StringIO(apps_info.strip()))
-                return {
-                    row.get("Name", "").lower(): row.get("AppID", "")
-                    for row in reader
-                    if row.get("Name") and row.get("AppID")
-                }
-            except Exception as e:
-                logger.warning(f"Error parsing AppsFolder display names: {e}")
+        try:
+            folder = win32com.client.Dispatch("Shell.Application").NameSpace(
+                "shell:::{4234d49b-0245-4df3-b780-3893943456e1}"
+            )
+            return {
+                item.Name.lower(): item.Path for item in folder.Items() if item.Name and item.Path
+            }
+        except Exception as e:
+            logger.warning(f"Error reading AppsFolder display names: {e}")
         return {}
 
     def _get_apps_from_shortcuts(self) -> dict[str, str]:
-        """Scan Start Menu folders for .lnk shortcuts as a fallback for Get-StartApps."""
+        """Scan Start Menu folders for .lnk shortcuts as a fallback for the AppsFolder."""
         import glob
 
         apps = {}
@@ -576,13 +551,11 @@ class Desktop:
 
     def _check_app_exists(self, app_id: str) -> bool:
         """Check if an app with the given AppID exists in shell:AppsFolder."""
-        safe_app_id = ps_quote(app_id)
-        command = (
-            f"$folder = (New-Object -ComObject Shell.Application).NameSpace('shell:AppsFolder'); "
-            f"if ($folder) {{ [bool]$folder.ParseName({safe_app_id}) }} else {{ $false }}"
-        )
-        response, status = PowerShellExecutor.execute_command(command)
-        return status == 0 and response.strip().lower() == "true"
+        try:
+            folder = win32com.client.Dispatch("Shell.Application").NameSpace("shell:AppsFolder")
+            return folder is not None and folder.ParseName(app_id) is not None
+        except Exception:
+            return False
 
     def launch_app(self, name: str) -> tuple[str, int, int]:
         apps_map = self.get_apps_from_start_menu()
@@ -594,23 +567,27 @@ class Desktop:
         if appid is None:
             return (f"{name.title()} not found in start menu.", 1, 0)
 
-        pid = 0
         if os.path.exists(appid) or "\\" in appid:
-            exe_path = resolve_known_folder_guid_path(appid)
-            safe_exe_path = ps_quote(exe_path)
-            command = f"Start-Process {safe_exe_path} -PassThru | Select-Object -ExpandProperty Id"
-            response, status = PowerShellExecutor.execute_command(command)
-            if status == 0 and response.strip().isdigit():
-                pid = int(response.strip())
+            target = resolve_known_folder_guid_path(appid)
+        elif self._check_app_exists(appid):
+            target = f"shell:AppsFolder\\{appid}"
         else:
-            if not self._check_app_exists(appid):
-                return (f"Invalid app identifier: {appid}", 1, 0)
+            return (f"Invalid app identifier: {appid}", 1, 0)
 
-            safe = ps_quote(f"shell:AppsFolder\\{appid}")
-            command = f"Start-Process {safe}"
-            response, status = PowerShellExecutor.execute_command(command)
+        try:
+            info = shell.ShellExecuteEx(
+                fMask=shellcon.SEE_MASK_NOCLOSEPROCESS | shellcon.SEE_MASK_FLAG_NO_UI,
+                lpFile=target,
+                nShow=win32con.SW_SHOWNORMAL,
+            )
+        except pywintypes.error as e:
+            return (f"Failed to launch {name.title()}: {e.strerror}", 1, 0)
 
-        return response, status, pid
+        pid = 0
+        if info["hProcess"]:
+            pid = win32process.GetProcessId(info["hProcess"])
+            info["hProcess"].Close()
+        return ("", 0, pid)
 
     def switch_app(self, name: str):
         try:
