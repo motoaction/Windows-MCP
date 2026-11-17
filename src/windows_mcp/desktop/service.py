@@ -12,7 +12,7 @@ from windows_mcp.vdm.core import (
 from windows_mcp.desktop.views import DesktopState, Window, Browser, Status, Size, Display
 from windows_mcp.tree.views import BoundingBox, TreeElementNode, TreeState, SemanticNode
 from PIL import ImageFont, ImageDraw, Image
-from windows_mcp.tree.service import Tree
+from windows_mcp.tree.service import Tree, _excluded_process_names, _window_process_name
 from windows_mcp.desktop import screenshot as screenshot_capture
 from windows_mcp.desktop.control import get_controller
 from windows_mcp.desktop import flash_overlay
@@ -206,7 +206,10 @@ class Desktop:
         try:
             active_desktop = get_current_desktop()
             all_desktops = get_all_desktops()
-        except RuntimeError:
+        except Exception:
+            # The virtual desktop calls raise COMError, not RuntimeError, for example after
+            # explorer.exe restarts. Report the default desktop instead of failing the capture.
+            logger.warning("Could not read the virtual desktops", exc_info=True)
             active_desktop = {
                 "id": "00000000-0000-0000-0000-000000000000",
                 "name": "Default Desktop",
@@ -240,8 +243,13 @@ class Desktop:
                     for window in windows
                     if self._filter_window_to_region(window, screenshot_region) is not None
                 )
+            # controls_handles is in z-order, front first. Keep that order: the tree walks the
+            # windows in the order given and skips the rest once the element limit is reached.
+            z_order = {handle: index for index, handle in enumerate(controls_handles)}
             tree_state = self.tree.get_state(
-                tree_active_window_handle, list(other_windows_handles), use_dom=use_dom
+                tree_active_window_handle,
+                sorted(other_windows_handles, key=lambda h: z_order.get(h, len(z_order))),
+                use_dom=use_dom,
             )
         else:
             root_box = screenshot_region or self.tree.screen_box
@@ -290,6 +298,10 @@ class Desktop:
                 )
             else:
                 screenshot = self.get_screenshot(capture_rect=capture_rect)
+                if grid_lines:
+                    # use_annotation=False leaves out the element boxes, not a requested grid.
+                    screenshot = screenshot.copy()
+                    self._draw_grid_lines(screenshot, grid_lines)
 
             screenshot_original_size = Size(width=screenshot.width, height=screenshot.height)
 
@@ -474,19 +486,20 @@ class Desktop:
         """Find a window by fuzzy name match. Returns (window, error_msg).
         If the returned window is None, error_msg describes the failure reason.
 
-        If refresh_state is True, always refresh desktop_state before searching;
-        otherwise refresh only when desktop_state is absent or empty.
+        If refresh_state is True, always list the windows again before searching;
+        otherwise do so only when desktop_state is absent or empty.
         """
         if refresh_state or self.desktop_state is None or not self.desktop_state.windows:
-            self.get_state()
-        if self.desktop_state is None:
-            return None, "Failed to get desktop state. Please try again."
-
-        window_list = [
-            w
-            for w in [self.desktop_state.active_window] + (self.desktop_state.windows or [])
-            if w is not None
-        ]
+            # Matching a title needs only the top-level windows. get_state() would also walk
+            # the UI tree of every window, and one app that does not answer a UIA request
+            # can hold that walk for minutes (#577).
+            window_list, _ = self.get_windows()
+        else:
+            window_list = [
+                w
+                for w in [self.desktop_state.active_window] + (self.desktop_state.windows or [])
+                if w is not None
+            ]
         if not window_list:
             return None, "No windows found on the desktop."
 
@@ -614,7 +627,9 @@ class Desktop:
 
     def switch_app(self, name: str):
         try:
-            window, error = self._find_window_by_name(name)
+            # Match against the windows open now, as resize does. The last capture's list misses
+            # windows opened or reopened since, and everything outside a display/region capture.
+            window, error = self._find_window_by_name(name, refresh_state=True)
             if window is None:
                 return error, 1
 
@@ -775,7 +790,21 @@ class Desktop:
                 f"x={left}..{right}, y={top}..{bottom}"
             )
 
-    def click(self, loc: tuple[int, int] | list[int], button: str = "left", clicks: int = 1):
+    @staticmethod
+    def _modal_dialog_warning(x: int, y: int) -> str:
+        """Name the modal dialog that would swallow a click at (x, y), if any (#557)."""
+        try:
+            root = win32gui.GetAncestor(win32gui.WindowFromPoint((x, y)), win32con.GA_ROOT)
+            if not root or win32gui.IsWindowEnabled(root):
+                return ""
+            popup = win32gui.GetWindow(root, win32con.GW_ENABLEDPOPUP)
+            title = win32gui.GetWindowText(popup) if popup != root else ""
+            dialog = f"the modal dialog '{title}'" if title else "an open modal dialog"
+            return f"Warning: the window there is disabled by {dialog}, so the click went nowhere."
+        except Exception:
+            return ""
+
+    def click(self, loc: tuple[int, int] | list[int], button: str = "left", clicks: int = 1) -> str:
         owner = get_controller()
         owner.checkpoint_current()
         if isinstance(loc, list):
@@ -786,7 +815,9 @@ class Desktop:
         if clicks == 0:
             owner.checkpoint_current()
             uia.SetCursorPos(x, y)
-            return
+            return ""
+        # Ask before clicking: a click that opens its own dialog must not look blocked.
+        blocked = self._modal_dialog_warning(x, y)
         control_overlay.ripple(x, y)
         match button:
             case "left":
@@ -810,6 +841,7 @@ class Desktop:
                     owner.checkpoint_current()
                     uia.MiddleClick(x, y)
                     owner.record_step_current()
+        return blocked
 
     # Strings longer than this typed via clipboard paste instead of
     # per-key SendKeys. SendKeys at high cadence loses keystrokes on
@@ -842,13 +874,17 @@ class Desktop:
         self._validate_screen_point(x, y)
         uia.Click(x, y)
         owner.record_step_current()
-        if caret_position == "start":
+        if caret_position in ("start", "end"):
+            key = "{Home}" if caret_position == "start" else "{End}"
+            # In a multi-line field Home and End stop at the ends of the clicked
+            # line; Ctrl+Home and Ctrl+End reach the start and end of the text.
+            # Ctrl+End means something else in a grid or list, so only use it
+            # once the focused element is the multi-line one that was clicked.
+            field = self._focused_element_at(x, y)
+            if field is not None and self._is_multiline(field):
+                key = "{Ctrl}" + key
             owner.checkpoint_current()
-            uia.SendKeys("{Home}", waitTime=0.05)
-            owner.record_step_current()
-        elif caret_position == "end":
-            owner.checkpoint_current()
-            uia.SendKeys("{End}", waitTime=0.05)
+            uia.SendKeys(key, waitTime=0.05)
             owner.record_step_current()
         notes: list[str] = []
         target = None
@@ -888,6 +924,35 @@ class Desktop:
             return uia.GetFocusedControl()
         except Exception:
             return None
+
+    # How long a click may take to move keyboard focus before Type stops
+    # waiting to learn which element it reached.
+    _FOCUS_SETTLE_SECONDS = 0.5
+
+    def _focused_element_at(self, x: int, y: int) -> "uia.Control | None":
+        """The focused element once it is the element at (x, y), else None.
+
+        UIA can still report the element focused before the click. That may be
+        a document that contains the point (a whole web page) while the click
+        went to a grid inside it.
+        """
+        try:
+            clicked = uia.ControlFromPoint(x, y)
+        except Exception:
+            return None
+        if clicked is None:
+            return None
+        deadline = perf_counter() + self._FOCUS_SETTLE_SECONDS
+        while True:
+            focused = self._focused_control()
+            try:
+                if focused is not None and uia.ControlsAreSame(focused, clicked):
+                    return focused
+            except Exception:
+                return None
+            if perf_counter() >= deadline:
+                return None
+            sleep(0.05)
 
     @staticmethod
     def _describe(control) -> str:
@@ -1052,12 +1117,16 @@ class Desktop:
         """Stash text on the clipboard, Ctrl+V, restore prior clipboard.
         Plain-text only — control chars (newlines, tabs, braces) need to
         route through SendKeys instead so escape sequences are honored.
+
+        The prior clipboard is restored in every format held in memory, not
+        just as text: an image or files copied in Explorer read as "" through
+        GetClipboardText, so the user's clipboard was left holding empty text.
         """
         prior = None
         owner = get_controller()
         owner.checkpoint_current()
         try:
-            prior = uia.GetClipboardText()
+            prior = uia.GetClipboardSnapshot()
         except Exception:
             pass
         uia.SetClipboardText(text)
@@ -1072,7 +1141,7 @@ class Desktop:
             if prior is not None:
                 try:
                     if uia.GetClipboardText() == text:
-                        uia.SetClipboardText(prior)
+                        uia.SetClipboardSnapshot(prior)
                 except Exception:
                     pass
 
@@ -1082,9 +1151,20 @@ class Desktop:
         type: Literal["horizontal", "vertical"] = "vertical",
         direction: Literal["up", "down", "left", "right"] = "down",
         wheel_times: int = 1,
-    ) -> str | None:
+    ) -> None:
         owner = get_controller()
         owner.checkpoint_current()
+        # Check the request before the pointer moves. A direction that does not
+        # fit the type was answered with a successful reply after hovering loc,
+        # and a count below 1 hovered loc without scrolling.
+        directions = {"vertical": ("up", "down"), "horizontal": ("left", "right")}
+        if type not in directions:
+            raise ValueError('Invalid type. Use "horizontal" or "vertical".')
+        if direction not in directions[type]:
+            first, second = directions[type]
+            raise ValueError(f'Invalid direction. Use "{first}" or "{second}".')
+        if wheel_times < 1:
+            raise ValueError("wheel_times must be 1 or more")
         if loc:
             self.move(loc)
         match type:
@@ -1100,8 +1180,6 @@ class Desktop:
                             owner.checkpoint_current()
                             uia.WheelDown(1)
                             owner.record_step_current()
-                    case _:
-                        return 'Invalid direction. Use "up" or "down".'
             case "horizontal":
                 match direction:
                     case "left":
@@ -1132,11 +1210,6 @@ class Desktop:
                                 owner.record_step_current()
                         finally:
                             owner.input_ledger.release("key:shift")
-                    case _:
-                        return 'Invalid direction. Use "left" or "right".'
-            case _:
-                return 'Invalid type. Use "horizontal" or "vertical".'
-        return None
 
     def _normalize_drag_duration(self, duration: float | int | str | None) -> float | None:
         if duration is None:
@@ -1174,6 +1247,11 @@ class Desktop:
             None if from_loc is None else self._normalize_drag_point(from_loc, "from_loc")
         )
         effective_duration = self._normalize_drag_duration(duration)
+        # Check both ends before the wait and the button press: SetCursorPos would
+        # clamp a point off the desktop to its edge.
+        if normalized_from_loc is not None:
+            self._validate_screen_point(*normalized_from_loc)
+        self._validate_screen_point(x, y)
         owner.checkpoint_current()
         sleep(0.5)
         owner.checkpoint_current()
@@ -1211,6 +1289,7 @@ class Desktop:
     def move(self, loc: tuple[int, int]):
         owner = get_controller()
         x, y = loc
+        self._validate_screen_point(x, y)
         owner.checkpoint_current()
         cx, cy = uia.GetCursorPos()
         steps = max(1, min(80, max(abs(x - cx), abs(y - cy)) // 20))
@@ -1236,6 +1315,8 @@ class Desktop:
         # Validate every point before Ctrl goes down, so bad input fails without
         # touching the keyboard (and without clicking half of the list).
         points = [self._normalize_drag_point(loc, f"locs[{i}]") for i, loc in enumerate(locs)]
+        for x, y in points:
+            self._validate_screen_point(x, y)
         try:
             if press_ctrl:
                 owner.input_ledger.press(
@@ -1254,6 +1335,13 @@ class Desktop:
                 owner.input_ledger.release("key:ctrl")
 
     def multi_edit(self, locs: list[tuple[int, int, str]]) -> list[str]:
+        # Check every field first. Type checks its own point too, but only after
+        # the fields before it have been cleared and retyped, and it fails on a
+        # text that is not a string only after clicking and clearing its field.
+        for x, y, text in locs:
+            if not isinstance(text, str):
+                raise ValueError(f"Text for the field at ({x},{y}) must be a string, not {text!r}")
+            self._validate_screen_point(x, y)
         notes = []
         for loc in locs:
             get_controller().checkpoint_current()
@@ -1426,6 +1514,11 @@ class Desktop:
         # don't pass that into ControlFromHandle, which would raise.
         if not handle:
             return None
+        excluded_processes = _excluded_process_names()
+        if excluded_processes:
+            process_name = _window_process_name(handle)
+            if process_name and process_name.casefold() in excluded_processes:
+                return None
         return self.get_window_from_element_handle(handle)
 
     def get_window_from_element_handle(self, element_handle: int) -> uia.Control:
@@ -1444,8 +1537,14 @@ class Desktop:
         try:
             windows = []
             window_handles = set()
-            controls_handles = controls_handles or self.get_controls_handles()
+            if controls_handles is None:
+                controls_handles = self.get_controls_handles()
+            excluded_processes = _excluded_process_names()
             for depth, hwnd in enumerate(controls_handles):
+                if excluded_processes:
+                    process_name = _window_process_name(hwnd)
+                    if process_name and process_name.casefold() in excluded_processes:
+                        continue
                 try:
                     child = uia.ControlFromHandle(hwnd)
                 except Exception:
@@ -1460,17 +1559,16 @@ class Desktop:
                     if window_pattern is None:
                         continue
 
-                    if window_pattern.CanMinimize and window_pattern.CanMaximize:
-                        status = self.get_window_status(child)
+                    status = self.get_window_status(child)
 
-                        bounding_rect = child.BoundingRectangle
-                        if bounding_rect.isempty() and status != Status.MINIMIZED:
-                            continue
+                    bounding_rect = child.BoundingRectangle
+                    if bounding_rect.isempty() and status != Status.MINIMIZED:
+                        continue
 
-                        windows.append(
-                            Window(
-                                **{
-                                    "name": child.Name,
+                    windows.append(
+                        Window(
+                            **{
+                                "name": child.Name,
                                     "depth": depth,
                                     "status": status,
                                     "bounding_box": BoundingBox(
@@ -1531,7 +1629,7 @@ class Desktop:
 
         unique_values: list[int] = []
         for value in values:
-            if not isinstance(value, int) or value < 0:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError("display must contain only zero-based active display indices")
             if value not in unique_values:
                 unique_values.append(value)
@@ -1631,6 +1729,19 @@ class Desktop:
         flash_overlay.show_capture_flash(capture_rect)
         return image
 
+    @staticmethod
+    def _draw_grid_lines(image: Image.Image, grid_lines: tuple[int, int]) -> None:
+        """Divide the image into grid_lines = (columns, rows) equal cells with light gray lines."""
+        draw = ImageDraw.Draw(image)
+        image_width, image_height = image.size
+        w_count, h_count = grid_lines
+        for i in range(1, w_count):
+            x = image_width * i // w_count
+            draw.line([(x, 0), (x, image_height)], fill=(200, 200, 200, 128), width=1)
+        for i in range(1, h_count):
+            y = image_height * i // h_count
+            draw.line([(0, y), (image_width, y)], fill=(200, 200, 200, 128), width=1)
+
     def get_annotated_screenshot(
         self,
         nodes: list[TreeElementNode],
@@ -1675,13 +1786,7 @@ class Desktop:
 
         # Draw grid lines if requested
         if grid_lines:
-            w_count, h_count = grid_lines
-            for i in range(1, w_count):
-                x = image_width * i // w_count
-                draw.line([(x, 0), (x, image_height)], fill=(200, 200, 200, 128), width=1)
-            for i in range(1, h_count):
-                y = image_height * i // h_count
-                draw.line([(0, y), (image_width, y)], fill=(200, 200, 200, 128), width=1)
+            self._draw_grid_lines(annotated_screenshot, grid_lines)
 
         def draw_annotation(label, node: TreeElementNode):
             box = node.bounding_box
