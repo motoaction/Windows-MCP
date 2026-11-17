@@ -77,6 +77,8 @@ def test_launching_a_path_returns_the_started_process_id(monkeypatch: pytest.Mon
 
     assert Desktop.__new__(Desktop).launch_app("Legacy App") == ("", 0, 4321)
     assert calls[-1]["lpFile"] == exe_path
+    # No message loop on the calling thread: the launch must complete synchronously.
+    assert calls[-1]["fMask"] & service.shellcon.SEE_MASK_FLAG_DDEWAIT
 
 
 def test_a_refused_launch_is_reported_as_failed(monkeypatch: pytest.MonkeyPatch) -> None:
