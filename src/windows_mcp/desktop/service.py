@@ -110,6 +110,9 @@ def _shortcut_to_sendkeys(shortcut: str) -> str:
 
 # DWMWINDOWATTRIBUTE: nonzero when DWM hides a window (dwmapi.h).
 _DWMWA_CLOAKED = 14
+# Hover popups over a window: common-controls tooltips (tooltips_class32),
+# WinForms and Delphi hint windows. They forward the mouse to what lies beneath.
+_HOVER_POPUP_CLASS = re.compile(r"tooltip|hint", re.IGNORECASE)
 
 
 def _snapshot_profile_enabled() -> bool:
@@ -810,7 +813,8 @@ class Desktop:
         WindowFromPoint skips disabled windows, so behind a modal dialog it returns
         whatever enabled window lies under the disabled owner instead of the owner.
         EnumWindows lists top-level windows in z-order, disabled ones included.
-        Click-through windows and this server's own overlays are skipped.
+        Click-through windows, hover tooltips and hints (which pass the mouse on
+        and never take keys) and this server's own overlays are skipped.
         """
         own_pid = os.getpid()
         found: list[int] = []
@@ -823,6 +827,7 @@ class Desktop:
                     & win32con.WS_EX_TRANSPARENT
                     and win32process.GetWindowThreadProcessId(hwnd)[1] != own_pid
                     and not cls._is_cloaked(hwnd)
+                    and not _HOVER_POPUP_CLASS.search(win32gui.GetClassName(hwnd))
                 ):
                     left, top, right, bottom = win32gui.GetWindowRect(hwnd)
                     if left <= x < right and top <= y < bottom:

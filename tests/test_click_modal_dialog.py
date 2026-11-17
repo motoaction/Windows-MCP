@@ -161,7 +161,9 @@ class FakeWindow:
         click_through: bool = False,
         pid: int = 4242,
         cloaked: bool = False,
+        class_name: str = "#32770",
     ) -> None:
+        self.class_name = class_name
         self.rect = rect
         self.visible = visible
         self.click_through = click_through
@@ -189,6 +191,7 @@ def _windows_in_z_order(monkeypatch: pytest.MonkeyPatch, windows: dict[int, Fake
     )
     monkeypatch.setattr(Desktop, "_is_cloaked", staticmethod(lambda h: windows[h].cloaked))
     monkeypatch.setattr(service.win32gui, "GetWindowRect", lambda h: windows[h].rect)
+    monkeypatch.setattr(service.win32gui, "GetClassName", lambda h: windows[h].class_name)
 
 
 def test_the_hit_test_finds_a_disabled_owner_that_window_from_point_skips(
@@ -210,10 +213,12 @@ def test_the_hit_test_finds_a_disabled_owner_that_window_from_point_skips(
 
 
 def test_the_hit_test_skips_windows_nobody_can_click(monkeypatch: pytest.MonkeyPatch) -> None:
-    overlay, hidden, cloaked, click_through, app = 0x10, 0x20, 0x30, 0x40, 0x50
+    overlay, hidden, cloaked, click_through, tooltip, app = 0x10, 0x20, 0x30, 0x40, 0x45, 0x50
     _windows_in_z_order(
         monkeypatch,
         {
+            # A tooltip over a disabled owner must not hide the modal that disables it.
+            tooltip: FakeWindow((0, 0, 1920, 1080), class_name="tooltips_class32"),
             overlay: FakeWindow((0, 0, 1920, 1080), pid=service.os.getpid()),
             hidden: FakeWindow((0, 0, 1920, 1080), visible=False),
             cloaked: FakeWindow((0, 0, 1920, 1080), cloaked=True),
