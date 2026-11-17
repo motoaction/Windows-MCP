@@ -1476,6 +1476,46 @@ class Desktop:
             return True
         return not name and len(element.GetChildren()) == 0
 
+    @staticmethod
+    def _whole_window_title(hwnd: int) -> str:
+        user32 = ctypes.windll.user32
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return ""
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buffer, length + 1)
+        return buffer.value
+
+    @staticmethod
+    def visible_window_titles() -> list[str]:
+        """Titles of the visible top-level windows, on any virtual desktop.
+
+        Read with EnumWindows rather than the UI tree, so dialogs and message
+        boxes count even where get_windows leaves them out, and no tree capture
+        is needed. Nothing that may still be on screen is left out, as a window
+        missed here reads as closed: no virtual-desktop filter (it can answer
+        false for a window just opened), and each title is read whole (pywin32's
+        GetWindowText stops at 511 characters). This server's own overlay
+        windows are skipped.
+        """
+        titles: list[str] = []
+        own_pid = os.getpid()
+
+        def callback(hwnd, _):
+            try:
+                if (
+                    win32gui.IsWindowVisible(hwnd)
+                    and win32process.GetWindowThreadProcessId(hwnd)[1] != own_pid
+                    and (title := Desktop._whole_window_title(hwnd))
+                ):
+                    titles.append(title)
+            except Exception:
+                pass
+            return True
+
+        win32gui.EnumWindows(callback, None)
+        return titles
+
     def get_controls_handles(self, optimized: bool = False) -> list[int]:
         handles = []
         own_pid = os.getpid()
