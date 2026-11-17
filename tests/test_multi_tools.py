@@ -93,3 +93,19 @@ def test_multiedit_uses_bulk_coordinate_resolution():
     assert result == "Multi-edited elements at: (10,10) with text 'First', (40,40) with text 'Second'"
     desktop.get_coordinates_from_labels.assert_called_once_with([0, 1])
     desktop.multi_edit.assert_called_once_with([[10, 10, "First"], [40, 40, "Second"]])
+
+def test_multiedit_reports_a_read_back_warning_after_the_clear_note():
+    # Every field is cleared first, so a note that warns of a wrong value starts with
+    # "Cleared"; dropping it hid an amount whose sign the field had kept.
+    desktop = MagicMock()
+    desktop.multi_edit.return_value = [
+        "Cleared EditControl with Home, Shift+End, Backspace. Field reads back 'Ann'.",
+        "Cleared EditControl with Home, Shift+End, Backspace. "
+        "Warning at (40,40): the field reads back '-1 122,17', not the typed text.",
+    ]
+    tools = register_tools(desktop)
+
+    result = asyncio.run(tools["MultiEdit"](locs=[[10, 10, "Ann"], [40, 40, "1122,17"]]))
+
+    assert "Warning at (40,40): the field reads back '-1 122,17'" in result
+    assert "reads back 'Ann'" not in result
