@@ -914,8 +914,9 @@ class Desktop:
                 owner.checkpoint_current()
                 uia.SendKeys(_escape_text_for_sendkeys(ch), interval=0.04, waitTime=0.05)
                 owner.record_step_current()
-        if clear or text:
-            notes.append(self._read_back(target, text, clear, has_control_chars))
+        # An empty text without clear only reads the field: a way to check a value
+        # (a sign, an amount) that the UI tree does not expose.
+        notes.append(self._read_back(target, text, clear, has_control_chars))
         if press_enter:
             owner.checkpoint_current()
             uia.SendKeys("{Enter}", waitTime=0.05)

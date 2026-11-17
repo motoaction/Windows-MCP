@@ -390,3 +390,16 @@ def test_a_number_that_kept_a_sign_still_warns(
     note = desktop._read_back(field, "21318,00", clear=True, has_control_chars=False)
 
     assert note == "Warning: the field reads back '-21 318,00', not the typed text."
+
+
+def test_an_empty_type_reads_the_field_back_and_types_nothing(
+    desktop: Desktop, focus: Callable[..., list[str]]
+) -> None:
+    # Legacy dialogs leave some edits out of the UI tree; reading the field this way
+    # is how an agent checks an amount's sign before pressing OK.
+    keys = focus(FakeField("-1 434,58"))
+
+    note = desktop.type(loc=(100, 100), text="")
+
+    assert keys == []
+    assert note == "Field reads back '-1 434,58'."
