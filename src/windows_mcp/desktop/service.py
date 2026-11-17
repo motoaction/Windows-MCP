@@ -108,6 +108,16 @@ def _shortcut_to_sendkeys(shortcut: str) -> str:
     return sendkeys_str
 
 
+# A space (often a no-break or narrow no-break one) between two digits is a
+# thousands separator a number field adds as it formats "10777,00" to
+# "10 777,00"; it is not a difference in what was typed.
+_DIGIT_GROUP_SPACE = re.compile(r"(?<=\d)\s(?=\d)")
+
+
+def _without_digit_group_spaces(text: str) -> str:
+    return _DIGIT_GROUP_SPACE.sub("", text)
+
+
 def _snapshot_profile_enabled() -> bool:
     value = os.getenv("WINDOWS_MCP_PROFILE_SNAPSHOT", "")
     return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -1109,7 +1119,8 @@ class Desktop:
         shown = value if len(value) <= limit else value[:limit] + "…"
         if has_control_chars:
             return f"Field reads back '{shown}'."
-        if (clear and value != text) or (not clear and text not in value):
+        typed, held = _without_digit_group_spaces(text), _without_digit_group_spaces(value)
+        if (clear and held != typed) or (not clear and typed not in held):
             return f"Warning: the field reads back '{shown}', not the typed text."
         return f"Field reads back '{shown}'."
 

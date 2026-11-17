@@ -364,3 +364,29 @@ def test_type_tool_appends_the_desktop_note() -> None:
     result = asyncio.run(mcp.tools["Type"](text="EF", loc=[100, 100], clear=True))
 
     assert result == "Typed EF at (100,100). Field reads back 'EF'."
+
+
+@pytest.mark.parametrize("formatted", ["10 777,00", "10 777,00", "10 777,00"])
+def test_a_number_the_field_groups_reads_back_without_a_warning(
+    desktop: Desktop, focus: Callable[..., list[str]], formatted: str
+) -> None:
+    # Number fields format "10777,00" as "10 777,00" once typed; warning on that
+    # every time hides the warning that matters (a sign or digit that differs).
+    field = FakeField(formatted)
+    focus(field)
+
+    note = desktop._read_back(field, "10777,00", clear=True, has_control_chars=False)
+
+    assert note == f"Field reads back '{formatted}'."
+
+
+def test_a_number_that_kept_a_sign_still_warns(
+    desktop: Desktop, focus: Callable[..., list[str]]
+) -> None:
+    # A clear that leaves the field's minus sign turns a typed amount negative.
+    field = FakeField("-21 318,00")
+    focus(field)
+
+    note = desktop._read_back(field, "21318,00", clear=True, has_control_chars=False)
+
+    assert note == "Warning: the field reads back '-21 318,00', not the typed text."
