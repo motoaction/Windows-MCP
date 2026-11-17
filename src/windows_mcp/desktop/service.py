@@ -1395,6 +1395,33 @@ class Desktop:
             return True
         return not name and len(element.GetChildren()) == 0
 
+    @staticmethod
+    def visible_window_titles() -> list[str]:
+        """Titles of the visible top-level windows on the current virtual desktop.
+
+        Read with EnumWindows rather than the UI tree, so dialogs and message
+        boxes count even where get_windows leaves them out, and no tree capture
+        is needed. This server's own overlay windows are skipped.
+        """
+        titles: list[str] = []
+        own_pid = os.getpid()
+
+        def callback(hwnd, _):
+            try:
+                if (
+                    win32gui.IsWindowVisible(hwnd)
+                    and is_window_on_current_desktop(hwnd)
+                    and win32process.GetWindowThreadProcessId(hwnd)[1] != own_pid
+                    and (title := win32gui.GetWindowText(hwnd))
+                ):
+                    titles.append(title)
+            except Exception:
+                pass
+            return True
+
+        win32gui.EnumWindows(callback, None)
+        return titles
+
     def get_controls_handles(self, optimized: bool = False) -> list[int]:
         handles = []
         own_pid = os.getpid()

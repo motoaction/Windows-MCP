@@ -240,3 +240,71 @@ def test_wait_for_timeout_reports_last_observed_state() -> None:
                 interval=0.001,
             )
         )
+
+
+class FakeWindowTitles(FakeDesktop):
+    """A desktop whose visible window titles change from one poll to the next."""
+
+    def __init__(self, polls: list[list[str]]) -> None:
+        super().__init__([])
+        self.polls = polls
+        self.title_reads = 0
+
+    def visible_window_titles(self) -> list[str]:
+        self.title_reads += 1
+        return self.polls.pop(0) if len(self.polls) > 1 else self.polls[0]
+
+
+def test_wait_for_window_closed_polls_until_the_dialog_is_gone() -> None:
+    # A dialog that stays open after OK (a refused value) must not go unnoticed.
+    desktop = FakeWindowTitles(
+        [["Accounts", "Change payment"], ["Accounts", "Change payment"], ["Accounts"]]
+    )
+    tools = _register_tools(desktop)
+
+    result = asyncio.run(
+        tools["WaitFor"](
+            condition="window_closed", text="change payment", timeout=1, interval=0.001
+        )
+    )
+
+    assert "condition 'window_closed' satisfied" in result
+    assert "3 attempt(s)" in result
+    assert desktop.calls == []
+
+
+def test_wait_for_window_closed_times_out_naming_the_open_window() -> None:
+    desktop = FakeWindowTitles([["Accounts", "Change payment"]])
+    tools = _register_tools(desktop)
+
+    with pytest.raises(TimeoutError, match="window 'Change payment' was still open"):
+        asyncio.run(
+            tools["WaitFor"](
+                condition="window_closed",
+                window_name="Change payment",
+                timeout=0.01,
+                interval=0.001,
+            )
+        )
+
+
+def test_wait_for_window_exists_matches_a_dialog_title() -> None:
+    desktop = FakeWindowTitles([["Accounts"], ["Accounts", "Information"]])
+    tools = _register_tools(desktop)
+
+    result = asyncio.run(
+        tools["WaitFor"](condition="window_exists", text="information", timeout=1, interval=0.001)
+    )
+
+    assert "window 'Information' is open" in result
+
+
+@pytest.mark.parametrize("condition", ["window_exists", "window_closed"])
+def test_wait_for_window_conditions_require_a_title(condition: str) -> None:
+    desktop = FakeWindowTitles([["Accounts"]])
+    tools = _register_tools(desktop)
+
+    with pytest.raises(ValueError, match=f"required when condition is {condition}"):
+        asyncio.run(tools["WaitFor"](condition=condition, timeout=1, interval=0.001))
+
+    assert desktop.title_reads == 0

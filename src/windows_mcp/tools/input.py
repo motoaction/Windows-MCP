@@ -16,10 +16,16 @@ from fastmcp import Context
 WaitForCondition = Literal[
     "text_exists",
     "active_window",
+    "window_exists",
+    "window_closed",
     "element_exists",
     "element_enabled",
     "focused_element",
 ]
+
+# Conditions answered from the titles of the visible top-level windows alone,
+# without capturing the UI tree.
+_WINDOW_TITLE_CONDITIONS = {"window_exists", "window_closed"}
 
 
 def _resolve_label(desktop: Any, label: int) -> list[int]:
@@ -163,6 +169,19 @@ def _matches_wait_condition(
     raise ValueError(f"Unsupported WaitFor condition: {condition}")
 
 
+def _matches_window_title_condition(
+    titles: list[str], condition: WaitForCondition, expected: str
+) -> tuple[bool, str]:
+    matching = [title for title in titles if _text_matches(title, expected)]
+    if condition == "window_exists":
+        if matching:
+            return True, f"window {matching[0]!r} is open"
+        return False, f"no window titled {expected!r} was open"
+    if not matching:
+        return True, f"no window titled {expected!r} is open"
+    return False, f"window {matching[0]!r} was still open"
+
+
 def _validate_wait_for_args(
     condition: str,
     text: str | None,
@@ -177,6 +196,8 @@ def _validate_wait_for_args(
     aliases = {
         "text": "text_exists",
         "window": "active_window",
+        "window_open": "window_exists",
+        "window_gone": "window_closed",
         "element": "element_exists",
         "enabled": "element_enabled",
         "focused": "focused_element",
@@ -185,14 +206,16 @@ def _validate_wait_for_args(
     valid_conditions = {
         "text_exists",
         "active_window",
+        "window_exists",
+        "window_closed",
         "element_exists",
         "element_enabled",
         "focused_element",
     }
     if normalized not in valid_conditions:
         raise ValueError(
-            "condition must be one of: text_exists, active_window, element_exists, "
-            "element_enabled, focused_element"
+            "condition must be one of: text_exists, active_window, window_exists, "
+            "window_closed, element_exists, element_enabled, focused_element"
         )
 
     if timeout <= 0 or timeout > 120:
@@ -204,6 +227,8 @@ def _validate_wait_for_args(
         raise ValueError("text is required when condition is text_exists")
     if normalized == "active_window" and not (text or window_name):
         raise ValueError("text or window_name is required when condition is active_window")
+    if normalized in _WINDOW_TITLE_CONDITIONS and not (text or window_name):
+        raise ValueError(f"text or window_name is required when condition is {normalized}")
     if normalized in {"element_exists", "element_enabled"} and not (text or window_name):
         raise ValueError(
             "text or window_name is required when condition is element_exists or element_enabled"
@@ -447,8 +472,11 @@ def register(
         description=(
             "Waits until a UI condition is satisfied, polling the Windows accessibility tree "
             "inside the tool to avoid repeated Snapshot calls. Conditions: text_exists, "
-            "active_window, element_exists, element_enabled, focused_element. Provide text "
-            "and/or window_name depending on the condition. Set use_dom=True for browser DOM text."
+            "active_window, window_exists, window_closed, element_exists, element_enabled, "
+            "focused_element. window_exists and window_closed match the title of any visible "
+            "top-level window, dialogs and message boxes included, so window_closed confirms "
+            "that a dialog went away after OK. Provide text and/or window_name depending on "
+            "the condition. Set use_dom=True for browser DOM text."
         ),
         annotations=ToolAnnotations(
             title="WaitFor",
@@ -484,18 +512,23 @@ def register(
 
         while True:
             attempts += 1
-            desktop_state = desktop.get_state(
-                use_vision=False,
-                use_dom=use_dom_bool,
-                use_ui_tree=True,
-                use_annotation=False,
-            )
-            matched, last_detail = _matches_wait_condition(
-                desktop_state=desktop_state,
-                condition=normalized,
-                text=text,
-                window_name=window_name,
-            )
+            if normalized in _WINDOW_TITLE_CONDITIONS:
+                matched, last_detail = _matches_window_title_condition(
+                    desktop.visible_window_titles(), normalized, window_name or text
+                )
+            else:
+                desktop_state = desktop.get_state(
+                    use_vision=False,
+                    use_dom=use_dom_bool,
+                    use_ui_tree=True,
+                    use_annotation=False,
+                )
+                matched, last_detail = _matches_wait_condition(
+                    desktop_state=desktop_state,
+                    condition=normalized,
+                    text=text,
+                    window_name=window_name,
+                )
             if matched:
                 elapsed = time.monotonic() - started_at
                 return (
