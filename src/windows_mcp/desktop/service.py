@@ -108,6 +108,10 @@ def _shortcut_to_sendkeys(shortcut: str) -> str:
     return sendkeys_str
 
 
+# DWMWINDOWATTRIBUTE: nonzero when DWM hides a window (dwmapi.h).
+_DWMWA_CLOAKED = 14
+
+
 def _snapshot_profile_enabled() -> bool:
     value = os.getenv("WINDOWS_MCP_PROFILE_SNAPSHOT", "")
     return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -791,10 +795,55 @@ class Desktop:
             )
 
     @staticmethod
-    def _blocking_dialog(x: int, y: int) -> str:
+    def _is_cloaked(hwnd: int) -> bool:
+        """Whether DWM hides the window (another virtual desktop, a suspended app)."""
+        cloaked = ctypes.c_uint(0)
+        result = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+            ctypes.c_void_p(hwnd), _DWMWA_CLOAKED, ctypes.byref(cloaked), ctypes.sizeof(cloaked)
+        )
+        return result == 0 and cloaked.value != 0
+
+    @classmethod
+    def _top_level_window_at(cls, x: int, y: int) -> int:
+        """The front-most visible top-level window whose rectangle holds (x, y), or 0.
+
+        WindowFromPoint skips disabled windows, so behind a modal dialog it returns
+        whatever enabled window lies under the disabled owner instead of the owner.
+        EnumWindows lists top-level windows in z-order, disabled ones included.
+        Click-through windows and this server's own overlays are skipped.
+        """
+        own_pid = os.getpid()
+        found: list[int] = []
+
+        def callback(hwnd, _):
+            try:
+                if (
+                    win32gui.IsWindowVisible(hwnd)
+                    and not win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+                    & win32con.WS_EX_TRANSPARENT
+                    and win32process.GetWindowThreadProcessId(hwnd)[1] != own_pid
+                    and not cls._is_cloaked(hwnd)
+                ):
+                    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+                    if left <= x < right and top <= y < bottom:
+                        found.append(hwnd)
+                        return False
+            except Exception:
+                pass
+            return True
+
+        try:
+            win32gui.EnumWindows(callback, None)
+        except Exception:
+            # pywin32 raises when the callback stops the enumeration early.
+            pass
+        return found[0] if found else 0
+
+    @classmethod
+    def _blocking_dialog(cls, x: int, y: int) -> str:
         """Name the modal dialog that disables the window at (x, y), or "" when none does."""
         try:
-            root = win32gui.GetAncestor(win32gui.WindowFromPoint((x, y)), win32con.GA_ROOT)
+            root = cls._top_level_window_at(x, y)
             if not root or win32gui.IsWindowEnabled(root):
                 return ""
             popup = win32gui.GetWindow(root, win32con.GW_ENABLEDPOPUP)
