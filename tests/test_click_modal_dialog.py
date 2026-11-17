@@ -120,3 +120,33 @@ def test_the_click_tool_repeats_the_warning(monkeypatch: pytest.MonkeyPatch) -> 
     assert answer == (
         "Single left clicked at (10,20). Warning: the window under the point is disabled."
     )
+
+
+def test_type_behind_a_modal_dialog_types_nothing(
+    desktop: Desktop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The click on the field is dropped, so the keys would go to the dialog's own control."""
+    _window_at(monkeypatch, enabled=False, title="Change payment")
+    keys: list[str] = []
+    monkeypatch.setattr(service.uia, "SendKeys", lambda key, *args, **kwargs: keys.append(key))
+    clicks: list[tuple[int, int]] = []
+    monkeypatch.setattr(service.uia, "Click", lambda x, y, *args, **kwargs: clicks.append((x, y)))
+
+    with pytest.raises(RuntimeError, match="Did not type.*'Change payment'"):
+        desktop.type(loc=(100, 200), text="-99,39", clear=True, press_enter=True)
+
+    assert keys == []
+    assert clicks == []
+
+
+def test_type_on_a_live_window_still_types(
+    desktop: Desktop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _window_at(monkeypatch, enabled=True)
+    keys: list[str] = []
+    monkeypatch.setattr(service.uia, "SendKeys", lambda key, *args, **kwargs: keys.append(key))
+    monkeypatch.setattr(service.uia, "GetFocusedControl", lambda: None)
+
+    desktop.type(loc=(100, 200), text="42")
+
+    assert keys == ["4", "2"]

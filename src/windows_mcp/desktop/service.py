@@ -791,18 +791,25 @@ class Desktop:
             )
 
     @staticmethod
-    def _modal_dialog_warning(x: int, y: int) -> str:
-        """Name the modal dialog that would swallow a click at (x, y), if any (#557)."""
+    def _blocking_dialog(x: int, y: int) -> str:
+        """Name the modal dialog that disables the window at (x, y), or "" when none does."""
         try:
             root = win32gui.GetAncestor(win32gui.WindowFromPoint((x, y)), win32con.GA_ROOT)
             if not root or win32gui.IsWindowEnabled(root):
                 return ""
             popup = win32gui.GetWindow(root, win32con.GW_ENABLEDPOPUP)
             title = win32gui.GetWindowText(popup) if popup != root else ""
-            dialog = f"the modal dialog '{title}'" if title else "an open modal dialog"
-            return f"Warning: the window there is disabled by {dialog}, so the click went nowhere."
+            return f"the modal dialog '{title}'" if title else "an open modal dialog"
         except Exception:
             return ""
+
+    @classmethod
+    def _modal_dialog_warning(cls, x: int, y: int) -> str:
+        """Name the modal dialog that would swallow a click at (x, y), if any (#557)."""
+        dialog = cls._blocking_dialog(x, y)
+        if not dialog:
+            return ""
+        return f"Warning: the window there is disabled by {dialog}, so the click went nowhere."
 
     def click(self, loc: tuple[int, int] | list[int], button: str = "left", clicks: int = 1) -> str:
         owner = get_controller()
@@ -872,6 +879,14 @@ class Desktop:
         owner.checkpoint_current()
         x, y = loc
         self._validate_screen_point(x, y)
+        # Windows drops the click on a window a modal dialog disables, so the keys
+        # would go to the dialog's focused control instead of the field.
+        dialog = self._blocking_dialog(x, y)
+        if dialog:
+            raise RuntimeError(
+                f"Did not type: the window at ({x},{y}) is disabled by {dialog}."
+                " Close the dialog first."
+            )
         uia.Click(x, y)
         owner.record_step_current()
         if caret_position in ("start", "end"):
