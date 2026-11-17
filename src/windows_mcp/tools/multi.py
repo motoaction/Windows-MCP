@@ -102,7 +102,7 @@ def register(mcp, *, get_desktop, get_analytics):
         notes = desktop.multi_edit(locs)
         elements_str = ", ".join([f"({e[0]},{e[1]}) with text '{e[2]}'" for e in locs])
         # A field's note starts with how it was cleared ("Cleared EditControl ..."), so its
-        # read-back warning sits further in; keep every note that carries one.
-        warnings = [n for n in notes or [] if isinstance(n, str) and "Warning" in n]
+        # warning sits further in; Desktop.multi_edit marks each one "Warning at (x,y):".
+        warnings = [n for n in notes or [] if isinstance(n, str) and "Warning at (" in n]
         result = f"Multi-edited elements at: {elements_str}"
         return "\n".join([result, *warnings])

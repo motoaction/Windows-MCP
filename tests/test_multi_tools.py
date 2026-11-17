@@ -99,7 +99,8 @@ def test_multiedit_reports_a_read_back_warning_after_the_clear_note():
     # "Cleared"; dropping it hid an amount whose sign the field had kept.
     desktop = MagicMock()
     desktop.multi_edit.return_value = [
-        "Cleared EditControl with Home, Shift+End, Backspace. Field reads back 'Ann'.",
+        "Cleared EditControl 'Warning threshold' with Home, Shift+End, Backspace."
+        " Field reads back 'Ann'.",
         "Cleared EditControl with Home, Shift+End, Backspace. "
         "Warning at (40,40): the field reads back '-1 122,17', not the typed text.",
     ]
