@@ -108,6 +108,23 @@ def _shortcut_to_sendkeys(shortcut: str) -> str:
     return sendkeys_str
 
 
+# A space (often a no-break or narrow no-break one) between two digits is a
+# thousands separator a number field adds as it formats "10777,00" to
+# "10 777,00"; it is not a difference in what was typed.
+_DIGIT_GROUP_SPACE = re.compile(r"(?<=\d)\s(?=\d)")
+
+
+def _without_digit_group_spaces(text: str) -> str:
+    return _DIGIT_GROUP_SPACE.sub("", text)
+
+
+# DWMWINDOWATTRIBUTE: nonzero when DWM hides a window (dwmapi.h).
+_DWMWA_CLOAKED = 14
+# Hover popups over a window: common-controls tooltips (tooltips_class32),
+# WinForms and Delphi hint windows. They forward the mouse to what lies beneath.
+_HOVER_POPUP_CLASS = re.compile(r"tooltip|hint", re.IGNORECASE)
+
+
 def _snapshot_profile_enabled() -> bool:
     value = os.getenv("WINDOWS_MCP_PROFILE_SNAPSHOT", "")
     return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -791,18 +808,72 @@ class Desktop:
             )
 
     @staticmethod
-    def _modal_dialog_warning(x: int, y: int) -> str:
-        """Name the modal dialog that would swallow a click at (x, y), if any (#557)."""
+    def _is_cloaked(hwnd: int) -> bool:
+        """Whether DWM hides the window (another virtual desktop, a suspended app)."""
+        cloaked = ctypes.c_uint(0)
+        result = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+            ctypes.c_void_p(hwnd), _DWMWA_CLOAKED, ctypes.byref(cloaked), ctypes.sizeof(cloaked)
+        )
+        return result == 0 and cloaked.value != 0
+
+    @classmethod
+    def _top_level_window_at(cls, x: int, y: int) -> int:
+        """The front-most visible top-level window whose rectangle holds (x, y), or 0.
+
+        WindowFromPoint skips disabled windows, so behind a modal dialog it returns
+        whatever enabled window lies under the disabled owner instead of the owner.
+        EnumWindows lists top-level windows in z-order, disabled ones included.
+        Click-through windows, hover tooltips and hints (which pass the mouse on
+        and never take keys) and this server's own overlays are skipped.
+        """
+        own_pid = os.getpid()
+        found: list[int] = []
+
+        def callback(hwnd, _):
+            try:
+                if (
+                    win32gui.IsWindowVisible(hwnd)
+                    and not win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+                    & win32con.WS_EX_TRANSPARENT
+                    and win32process.GetWindowThreadProcessId(hwnd)[1] != own_pid
+                    and not cls._is_cloaked(hwnd)
+                    and not _HOVER_POPUP_CLASS.search(win32gui.GetClassName(hwnd))
+                ):
+                    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+                    if left <= x < right and top <= y < bottom:
+                        found.append(hwnd)
+                        return False
+            except Exception:
+                pass
+            return True
+
         try:
-            root = win32gui.GetAncestor(win32gui.WindowFromPoint((x, y)), win32con.GA_ROOT)
+            win32gui.EnumWindows(callback, None)
+        except Exception:
+            # pywin32 raises when the callback stops the enumeration early.
+            pass
+        return found[0] if found else 0
+
+    @classmethod
+    def _blocking_dialog(cls, x: int, y: int) -> str:
+        """Name the modal dialog that disables the window at (x, y), or "" when none does."""
+        try:
+            root = cls._top_level_window_at(x, y)
             if not root or win32gui.IsWindowEnabled(root):
                 return ""
             popup = win32gui.GetWindow(root, win32con.GW_ENABLEDPOPUP)
             title = win32gui.GetWindowText(popup) if popup != root else ""
-            dialog = f"the modal dialog '{title}'" if title else "an open modal dialog"
-            return f"Warning: the window there is disabled by {dialog}, so the click went nowhere."
+            return f"the modal dialog '{title}'" if title else "an open modal dialog"
         except Exception:
             return ""
+
+    @classmethod
+    def _modal_dialog_warning(cls, x: int, y: int) -> str:
+        """Name the modal dialog that would swallow a click at (x, y), if any (#557)."""
+        dialog = cls._blocking_dialog(x, y)
+        if not dialog:
+            return ""
+        return f"Warning: the window there is disabled by {dialog}, so the click went nowhere."
 
     def click(self, loc: tuple[int, int] | list[int], button: str = "left", clicks: int = 1) -> str:
         owner = get_controller()
@@ -872,6 +943,14 @@ class Desktop:
         owner.checkpoint_current()
         x, y = loc
         self._validate_screen_point(x, y)
+        # Windows drops the click on a window a modal dialog disables, so the keys
+        # would go to the dialog's focused control instead of the field.
+        dialog = self._blocking_dialog(x, y)
+        if dialog:
+            raise RuntimeError(
+                f"Did not type: the window at ({x},{y}) is disabled by {dialog}."
+                " Close the dialog first."
+            )
         uia.Click(x, y)
         owner.record_step_current()
         if caret_position in ("start", "end"):
@@ -904,8 +983,9 @@ class Desktop:
                 owner.checkpoint_current()
                 uia.SendKeys(_escape_text_for_sendkeys(ch), interval=0.04, waitTime=0.05)
                 owner.record_step_current()
-        if clear or text:
-            notes.append(self._read_back(target, text, clear, has_control_chars))
+        # An empty text without clear only reads the field: a way to check a value
+        # (a sign, an amount) that the UI tree does not expose.
+        notes.append(self._read_back(target, text, clear, has_control_chars))
         if press_enter:
             owner.checkpoint_current()
             uia.SendKeys("{Enter}", waitTime=0.05)
@@ -1109,7 +1189,8 @@ class Desktop:
         shown = value if len(value) <= limit else value[:limit] + "…"
         if has_control_chars:
             return f"Field reads back '{shown}'."
-        if (clear and value != text) or (not clear and text not in value):
+        typed, held = _without_digit_group_spaces(text), _without_digit_group_spaces(value)
+        if (clear and held != typed) or (not clear and typed not in held):
             return f"Warning: the field reads back '{shown}', not the typed text."
         return f"Field reads back '{shown}'."
 
@@ -1395,6 +1476,46 @@ class Desktop:
             return True
         return not name and len(element.GetChildren()) == 0
 
+    @staticmethod
+    def _whole_window_title(hwnd: int) -> str:
+        user32 = ctypes.windll.user32
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return ""
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buffer, length + 1)
+        return buffer.value
+
+    @staticmethod
+    def visible_window_titles() -> list[str]:
+        """Titles of the visible top-level windows, on any virtual desktop.
+
+        Read with EnumWindows rather than the UI tree, so dialogs and message
+        boxes count even where get_windows leaves them out, and no tree capture
+        is needed. Nothing that may still be on screen is left out, as a window
+        missed here reads as closed: no virtual-desktop filter (it can answer
+        false for a window just opened), and each title is read whole (pywin32's
+        GetWindowText stops at 511 characters). This server's own overlay
+        windows are skipped.
+        """
+        titles: list[str] = []
+        own_pid = os.getpid()
+
+        def callback(hwnd, _):
+            try:
+                if (
+                    win32gui.IsWindowVisible(hwnd)
+                    and win32process.GetWindowThreadProcessId(hwnd)[1] != own_pid
+                    and (title := Desktop._whole_window_title(hwnd))
+                ):
+                    titles.append(title)
+            except Exception:
+                pass
+            return True
+
+        win32gui.EnumWindows(callback, None)
+        return titles
+
     def get_controls_handles(self, optimized: bool = False) -> list[int]:
         handles = []
         own_pid = os.getpid()
@@ -1569,23 +1690,23 @@ class Desktop:
                         Window(
                             **{
                                 "name": child.Name,
-                                    "depth": depth,
-                                    "status": status,
-                                    "bounding_box": BoundingBox(
-                                        left=bounding_rect.left,
-                                        top=bounding_rect.top,
-                                        right=bounding_rect.right,
-                                        bottom=bounding_rect.bottom,
-                                        width=bounding_rect.width(),
-                                        height=bounding_rect.height(),
-                                    ),
-                                    "handle": child.NativeWindowHandle,
-                                    "process_id": child.ProcessId,
-                                    "is_browser": self.is_window_browser(child),
-                                }
-                            )
+                                "depth": depth,
+                                "status": status,
+                                "bounding_box": BoundingBox(
+                                    left=bounding_rect.left,
+                                    top=bounding_rect.top,
+                                    right=bounding_rect.right,
+                                    bottom=bounding_rect.bottom,
+                                    width=bounding_rect.width(),
+                                    height=bounding_rect.height(),
+                                ),
+                                "handle": child.NativeWindowHandle,
+                                "process_id": child.ProcessId,
+                                "is_browser": self.is_window_browser(child),
+                            }
                         )
-                        window_handles.add(child.NativeWindowHandle)
+                    )
+                    window_handles.add(child.NativeWindowHandle)
         except Exception as ex:
             logger.error(f"Error in get_windows: {ex}")
             windows = []
