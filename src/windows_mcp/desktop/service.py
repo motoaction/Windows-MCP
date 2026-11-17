@@ -576,7 +576,11 @@ class Desktop:
 
         try:
             info = shell.ShellExecuteEx(
-                fMask=shellcon.SEE_MASK_NOCLOSEPROCESS | shellcon.SEE_MASK_FLAG_NO_UI,
+                # The UIA worker has no message loop, so the launch must finish
+                # before the call returns (SEE_MASK_NOASYNC, alias FLAG_DDEWAIT).
+                fMask=shellcon.SEE_MASK_NOCLOSEPROCESS
+                | shellcon.SEE_MASK_FLAG_NO_UI
+                | shellcon.SEE_MASK_FLAG_DDEWAIT,
                 lpFile=target,
                 nShow=win32con.SW_SHOWNORMAL,
             )
