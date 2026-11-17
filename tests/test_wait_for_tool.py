@@ -308,3 +308,34 @@ def test_wait_for_window_conditions_require_a_title(condition: str) -> None:
         asyncio.run(tools["WaitFor"](condition=condition, timeout=1, interval=0.001))
 
     assert desktop.title_reads == 0
+
+
+def test_visible_window_titles_keep_every_window_that_may_be_on_screen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A window missed here reads as closed, so only windows that cannot be on
+    # screen (hidden ones, this server's own overlays) are left out.
+    from windows_mcp.desktop import service
+    from windows_mcp.desktop.service import Desktop
+
+    long_title = "Ändra betalstatus " + "x" * 600
+    windows = {
+        0x10: (True, 4242, long_title),
+        0x20: (False, 4242, "Hidden"),
+        0x30: (True, service.os.getpid(), "AI overlay"),
+        0x40: (True, 4242, ""),
+        0x50: (True, 4242, "On another virtual desktop"),
+    }
+
+    def enum_windows(callback, extra) -> None:
+        for handle in windows:
+            callback(handle, extra)
+
+    monkeypatch.setattr(service.win32gui, "EnumWindows", enum_windows)
+    monkeypatch.setattr(service.win32gui, "IsWindowVisible", lambda h: windows[h][0])
+    monkeypatch.setattr(
+        service.win32process, "GetWindowThreadProcessId", lambda h: (1, windows[h][1])
+    )
+    monkeypatch.setattr(Desktop, "_whole_window_title", staticmethod(lambda h: windows[h][2]))
+
+    assert Desktop.visible_window_titles() == [long_title, "On another virtual desktop"]
