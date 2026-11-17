@@ -108,6 +108,16 @@ def _shortcut_to_sendkeys(shortcut: str) -> str:
     return sendkeys_str
 
 
+# A space (often a no-break or narrow no-break one) between two digits is a
+# thousands separator a number field adds as it formats "10777,00" to
+# "10 777,00"; it is not a difference in what was typed.
+_DIGIT_GROUP_SPACE = re.compile(r"(?<=\d)\s(?=\d)")
+
+
+def _without_digit_group_spaces(text: str) -> str:
+    return _DIGIT_GROUP_SPACE.sub("", text)
+
+
 # DWMWINDOWATTRIBUTE: nonzero when DWM hides a window (dwmapi.h).
 _DWMWA_CLOAKED = 14
 # Hover popups over a window: common-controls tooltips (tooltips_class32),
@@ -973,8 +983,9 @@ class Desktop:
                 owner.checkpoint_current()
                 uia.SendKeys(_escape_text_for_sendkeys(ch), interval=0.04, waitTime=0.05)
                 owner.record_step_current()
-        if clear or text:
-            notes.append(self._read_back(target, text, clear, has_control_chars))
+        # An empty text without clear only reads the field: a way to check a value
+        # (a sign, an amount) that the UI tree does not expose.
+        notes.append(self._read_back(target, text, clear, has_control_chars))
         if press_enter:
             owner.checkpoint_current()
             uia.SendKeys("{Enter}", waitTime=0.05)
@@ -1178,7 +1189,8 @@ class Desktop:
         shown = value if len(value) <= limit else value[:limit] + "…"
         if has_control_chars:
             return f"Field reads back '{shown}'."
-        if (clear and value != text) or (not clear and text not in value):
+        typed, held = _without_digit_group_spaces(text), _without_digit_group_spaces(value)
+        if (clear and held != typed) or (not clear and typed not in held):
             return f"Warning: the field reads back '{shown}', not the typed text."
         return f"Field reads back '{shown}'."
 
